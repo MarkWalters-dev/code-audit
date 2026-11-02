@@ -89,6 +89,11 @@ fn run(args: cli::Args) -> i32 {
     }
 
     let mut reports: Vec<(String, Vec<ecosystem::CheckOutcome>)> = Vec::new();
+    // Nested projects share subtrees: files/assets already covered by an
+    // ancestor project's secrets/zombie scan are skipped (discovery
+    // sorts parents before children, so the ancestor always runs first).
+    let mut scanned_files = std::collections::HashSet::new();
+    let mut scanned_assets = std::collections::HashSet::new();
     progress::discovered(projects.len());
     for (i, proj) in projects.iter().enumerate() {
         let proj_str = proj
@@ -185,8 +190,8 @@ fn run(args: cli::Args) -> i32 {
         // in its `notices:` section.
         if ctx.check_notices {
             let mut extra = toolchains::drift_notices(&proj.root);
-            extra.extend(secrets::scan_project(&proj.root));
-            extra.extend(deadcode::zombie_assets(&proj.root));
+            extra.extend(secrets::scan_project(&proj.root, &mut scanned_files));
+            extra.extend(deadcode::zombie_assets(&proj.root, &mut scanned_assets));
             if !extra.is_empty()
                 && let Some(first) = outcomes.first_mut()
             {

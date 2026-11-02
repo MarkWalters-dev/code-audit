@@ -34,6 +34,81 @@ fn rel_path(root: &Path, path: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Single-pass foreign-mention index.
+// ---------------------------------------------------------------------------
+
+/// Which needle patterns appear in a file other than their owner's, via
+/// one Aho-Corasick pass over the joined texts. This replaces the old
+/// per-candidate full-corpus scan: candidates × corpus bytes was
+/// quadratic (minutes on monorepos), this is linear.
+///
+/// `texts` are the corpus files in order; each owner is
+/// `(owner_file, needles)` where `owner_file` is the owner's own index
+/// into `texts` (`None` when the owner is not a corpus file, e.g. an
+/// asset). Returns per-owner liveness: true when any needle occurs in
+/// any file other than the owner's own.
+fn foreign_mentioned(texts: &[String], owners: &[(Option<usize>, Vec<String>)]) -> Vec<bool> {
+    let mut patterns: Vec<&str> = Vec::new();
+    let mut pattern_owner: Vec<usize> = Vec::new();
+    for (owner_idx, (_, needles)) in owners.iter().enumerate() {
+        for needle in needles {
+            if !needle.is_empty() {
+                patterns.push(needle.as_str());
+                pattern_owner.push(owner_idx);
+            }
+        }
+    }
+    let Ok(ac) = aho_corasick::AhoCorasick::new(&patterns) else {
+        return naive_foreign_mentioned(texts, owners);
+    };
+    // Joined haystack with file-start boundaries for match attribution.
+    let mut joined = String::new();
+    let mut starts: Vec<usize> = Vec::with_capacity(texts.len());
+    for text in texts {
+        starts.push(joined.len());
+        joined.push_str(text);
+        joined.push('\n');
+    }
+    let mut foreign = vec![false; owners.len()];
+    let mut unresolved = owners.len();
+    for mat in ac.find_overlapping_iter(&joined) {
+        let owner = pattern_owner[mat.pattern().as_usize()];
+        if foreign[owner] {
+            continue;
+        }
+        // File holding the match start (boundaries are sorted).
+        let file = starts
+            .partition_point(|&s| s <= mat.start())
+            .saturating_sub(1);
+        // A match outside the owner's own file (or the owner has no
+        // corpus file, e.g. an asset): resolved, never revisited.
+        if owners[owner].0.is_none_or(|own| own != file) {
+            foreign[owner] = true;
+            unresolved -= 1;
+            if unresolved == 0 {
+                break;
+            }
+        }
+    }
+    foreign
+}
+
+/// Correctness fallback when the automaton cannot be built
+/// (essentially unreachable at our pattern counts): the naive
+/// per-owner scan with identical semantics.
+fn naive_foreign_mentioned(texts: &[String], owners: &[(Option<usize>, Vec<String>)]) -> Vec<bool> {
+    owners
+        .iter()
+        .map(|(owner_file, needles)| {
+            texts.iter().enumerate().any(|(i, text)| {
+                owner_file.is_none_or(|own| own != i)
+                    && needles.iter().any(|n| !n.is_empty() && text.contains(n))
+            })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Python: modules nothing imports.
 // ---------------------------------------------------------------------------
 
@@ -169,67 +244,84 @@ pub fn node_dead(
 ) -> Vec<Notice> {
     let exts = ["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"];
     let files = walk_sources(root, &exts);
+    // Metro platform variants (`.ios.`/`.android.`/...) exist only in
+    // React Native trees: skip the 32-probe platform check per import
+    // when the tree has none.
+    let has_platform_files = files.iter().any(|p| {
+        p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n.contains(".ios.")
+                || n.contains(".android.")
+                || n.contains(".native.")
+                || n.contains(".web.")
+        })
+    });
     let mut texts: Vec<(&PathBuf, String)> = Vec::with_capacity(files.len());
     let mut used: HashSet<PathBuf> = HashSet::new();
+    // Barrel and utility imports repeat hundreds of times: resolve each
+    // (importer dir, spec) once.
+    let mut memo: HashMap<(PathBuf, String), Vec<PathBuf>> = HashMap::new();
     for path in &files {
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
         if let Some(dir) = path.parent() {
             for spec in node_all_imports(&text) {
-                for target in resolve_import(root, dir, &spec, aliases, &exts) {
-                    used.insert(target);
+                let key = (dir.to_path_buf(), spec.clone());
+                let targets = memo.entry(key).or_insert_with_key(|(dir, spec)| {
+                    resolve_import(root, dir, spec, aliases, &exts, has_platform_files)
+                });
+                for target in targets {
+                    used.insert(target.clone());
                 }
             }
         }
         texts.push((path, text));
     }
     let conventions = node_conventions(root, &files);
-    let mut corpus = String::new();
-    for (_, text) in &texts {
-        corpus.push_str(text);
-        corpus.push('\n');
-    }
     // Config/markup references count too (app.json plugins, index.html
     // entry scripts, tsconfig file lists): corpus only, never candidates.
+    let mut corpus: Vec<String> = texts.iter().map(|(_, t)| t.clone()).collect();
     for path in walk_sources(root, &["json", "html", "htm"]) {
         if let Ok(text) = std::fs::read_to_string(&path) {
-            corpus.push_str(&text);
-            corpus.push('\n');
+            corpus.push(text);
         }
     }
-    let mut out = Vec::new();
-    for (path, text) in &texts {
+    // Survivors of the graph checks become mention-index owners: the
+    // basename, plus the stem for extensionless refs (`./plugins/foo`
+    // in app.json) when long enough to not match prose by accident.
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut owners: Vec<(Option<usize>, Vec<String>)> = Vec::new();
+    for (idx, (path, text)) in texts.iter().enumerate() {
         if used.contains(*path)
             || entries.contains(*path)
             || is_node_entry(path, text, &conventions)
         {
             continue;
         }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        let mut needles = vec![name.to_string()];
+        if let Some((stem, _)) = name.rsplit_once('.')
+            && stem.len() >= 8
+        {
+            needles.push(stem.to_string());
+        }
+        candidates.push(idx);
+        owners.push((Some(idx), needles));
+    }
+    let mentioned = foreign_mentioned(&corpus, &owners);
+    let mut out = Vec::new();
+    for (candidate_pos, idx) in candidates.iter().enumerate() {
         // Referenced by a bare path string somewhere else (worker URL,
         // plugin map, dynamic segment)? Occurrences beyond the file's own
         // text mean another file mentions it.
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !name.is_empty() {
-            let self_hits = text.matches(name).count();
-            let total = corpus.matches(name).take(self_hits + 1).count();
-            if total > self_hits {
-                continue;
-            }
-            // Extensionless refs (`./plugins/with-foo` in app.json):
-            // the stem must be long enough to not match prose by accident.
-            if let Some((stem, _)) = name.rsplit_once('.')
-                && stem.len() >= 8
-            {
-                let self_stem = text.matches(stem).count();
-                let total_stem = corpus.matches(stem).take(self_stem + 1).count();
-                if total_stem > self_stem {
-                    continue;
-                }
-            }
+        if mentioned[candidate_pos] {
+            continue;
         }
         out.push(dead_notice(
-            &rel_path(root, path),
+            &rel_path(root, texts[*idx].0),
             "unreferenced file (never imported)".to_string(),
         ));
     }
@@ -380,44 +472,60 @@ fn is_node_entry(path: &Path, text: &str, conventions: &NodeConventions) -> bool
 
 /// All static import specifiers, relative ones included.
 fn node_all_imports(text: &str) -> Vec<String> {
-    static FROM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(
-            r#"(?:import\s*['"]([^'"]+)['"]|(?:import|export)[^'"]*?from\s*['"]([^'"]+)['"])"#,
-        )
+    // One pass per line: side-effect imports, `from` imports/exports,
+    // `require`/`import()` calls, and multi-line `} from "x"` closers.
+    static COMBINED_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r#"(?:import\s*['"](?P<side>[^'"]+)['"]"#,
+            r#"|(?:import|export)[^'"]*?from\s*['"](?P<from>[^'"]+)['"]"#,
+            r#"|(?:require|import)\s*\(\s*['"](?P<reqspec>[^'"]+)['"]"#,
+            r#"|^\s*\}\s*from\s*['"](?P<multi>[^'"]+)['"])"#,
+        ))
         .unwrap()
-    });
-    static REQ_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?:require|import)\s*\(\s*['"]([^'"]+)['"]"#).unwrap()
-    });
-    // Multi-line `import { ... } from "spec"`: the closing line carries
-    // `from` without the `import` keyword. `} from "x"` is unambiguous.
-    static MULTILINE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"^\s*\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
     });
     let mut out = Vec::new();
     for raw in text.lines() {
+        // Every branch needs one of these literals; memchr-fast reject.
+        if !raw.contains("import")
+            && !raw.contains("export")
+            && !raw.contains("require")
+            && !raw.contains("from")
+        {
+            continue;
+        }
         let line = raw.split("//").next().unwrap_or("");
-        for caps in FROM_RE.captures_iter(line) {
+        for caps in COMBINED_RE.captures_iter(line) {
             let spec = caps
-                .get(1)
-                .or_else(|| caps.get(2))
-                .unwrap()
-                .as_str()
-                .to_string();
-            out.push(spec);
-        }
-        for caps in MULTILINE_RE.captures_iter(line) {
-            out.push(caps.get(1).unwrap().as_str().to_string());
-        }
-        for caps in REQ_RE.captures_iter(line) {
-            let start = caps.get(0).unwrap().start();
-            if start > 0
-                && let Some(prev) = line[..start].chars().last()
-                && (prev.is_alphanumeric() || matches!(prev, '_' | '$' | '.'))
-            {
-                continue;
+                .name("side")
+                .or_else(|| caps.name("from"))
+                .or_else(|| caps.name("multi"))
+                .or_else(|| caps.name("reqspec"));
+            let Some(spec) = spec else { continue };
+            // `require(`/`import(` as a method call (`ObjC.import("x")`)
+            // is not a module load.
+            if caps.name("reqspec").is_some() {
+                let start = caps.get(0).unwrap().start();
+                if start > 0
+                    && let Some(prev) = line[..start].chars().last()
+                    && (prev.is_alphanumeric() || matches!(prev, '_' | '$' | '.'))
+                {
+                    continue;
+                }
             }
-            out.push(caps.get(1).unwrap().as_str().to_string());
+            // Side-effect `import` must be a standalone keyword:
+            // `value="import" class="…"` (JSX), `"agents-import", …`
+            // (strings), and `` `import "…" `` (templates) are not imports.
+            if caps.name("side").is_some() {
+                let start = caps.get(0).unwrap().start();
+                if start > 0
+                    && let Some(prev) = line[..start].chars().last()
+                    && (prev.is_alphanumeric()
+                        || matches!(prev, '_' | '$' | '.' | '"' | '\'' | '`' | '-' | '/' | ':'))
+                {
+                    continue;
+                }
+            }
+            out.push(spec.as_str().to_string());
         }
     }
     out
@@ -451,21 +559,29 @@ fn resolve_import(
     spec: &str,
     aliases: &[(String, Vec<String>)],
     exts: &[&str],
+    probe_platforms: bool,
 ) -> Vec<PathBuf> {
-    fn collect(base: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
+    fn collect(base: &Path, exts: &[&str], probe_platforms: bool, out: &mut Vec<PathBuf>) {
         if let Some(found) = resolve_file(base, exts) {
             out.push(found);
         }
-        out.extend(platform_variants(base, exts));
+        if probe_platforms {
+            out.extend(platform_variants(base, exts));
+        }
     }
     let mut out = Vec::new();
     if spec.starts_with('.') {
-        collect(&normalize_lexical(&importer_dir.join(spec)), exts, &mut out);
+        collect(
+            &normalize_lexical(&importer_dir.join(spec)),
+            exts,
+            probe_platforms,
+            &mut out,
+        );
         return out;
     }
     // `~/...` (nuxt/vite convention) is scan-root relative.
     if let Some(rest) = spec.strip_prefix("~/") {
-        collect(&root.join(rest), exts, &mut out);
+        collect(&root.join(rest), exts, probe_platforms, &mut out);
     }
     for (prefix, targets) in aliases {
         let rest = if spec == prefix {
@@ -483,7 +599,7 @@ fn resolve_import(
             } else {
                 root.join(mapped.trim_start_matches("./"))
             };
-            collect(&base, exts, &mut out);
+            collect(&base, exts, probe_platforms, &mut out);
         }
     }
     out
@@ -742,8 +858,10 @@ fn manifest_classes(root: &Path) -> HashSet<String> {
 
 /// Media, font, and document files whose basename (or stem) appears
 /// nowhere in textual sources. Runs once per project: asset references
-/// do not respect ecosystem boundaries.
-pub fn zombie_assets(root: &Path) -> Vec<Notice> {
+/// do not respect ecosystem boundaries. `done` holds assets already
+/// examined by an ancestor project (nested projects share subtrees):
+/// they are skipped, and every examined asset is recorded.
+pub fn zombie_assets(root: &Path, done: &mut HashSet<PathBuf>) -> Vec<Notice> {
     const ASSET_EXTS: &[&str] = &[
         "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "avif", "bmp", "mp3", "wav", "ogg",
         "mp4", "webm", "mov", "pdf", "ttf", "otf", "woff", "woff2",
@@ -759,21 +877,35 @@ pub fn zombie_assets(root: &Path) -> Vec<Notice> {
     if assets.is_empty() {
         return Vec::new();
     }
-    let mut corpus = String::new();
+    let mut corpus = Vec::new();
     for path in walk_sources(root, SOURCE_EXTS) {
         if let Ok(text) = std::fs::read_to_string(&path) {
-            corpus.push_str(&text);
-            corpus.push('\n');
+            corpus.push(text);
         }
     }
-    let mut out = Vec::new();
+    let mut candidates: Vec<(&PathBuf, String)> = Vec::new();
+    let mut owners: Vec<(Option<usize>, Vec<String>)> = Vec::new();
     for path in assets.iter().take(5000) {
+        // Already examined by an ancestor project's scan.
+        if !done.insert(path.clone()) {
+            continue;
+        }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if IMPLICIT.contains(&name) {
             continue;
         }
         let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
-        if !corpus.contains(name) && (stem.is_empty() || !corpus.contains(stem)) {
+        let mut needles = vec![name.to_string()];
+        if !stem.is_empty() {
+            needles.push(stem.to_string());
+        }
+        candidates.push((path, name.to_string()));
+        owners.push((None, needles));
+    }
+    let mentioned = foreign_mentioned(&corpus, &owners);
+    let mut out = Vec::new();
+    for (i, (path, name)) in candidates.iter().enumerate() {
+        if !mentioned[i] {
             out.push(dead_notice(
                 &rel_path(root, path),
                 format!("unreferenced asset '{name}'"),
@@ -1025,6 +1157,9 @@ mod tests {
         std::fs::write(dir.path().join("logo.png"), "fake").unwrap();
         std::fs::write(dir.path().join("old.svg"), "fake").unwrap();
         std::fs::write(dir.path().join("favicon.ico"), "fake").unwrap();
-        assert_eq!(names(&zombie_assets(dir.path())), vec!["old.svg"]);
+        assert_eq!(
+            names(&zombie_assets(dir.path(), &mut HashSet::new())),
+            vec!["old.svg"]
+        );
     }
 }

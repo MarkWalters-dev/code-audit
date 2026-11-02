@@ -12,10 +12,10 @@
 //! skips hex digests and UUIDs.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 
 use crate::ecosystem::{Notice, NoticeCheck};
 use crate::ghost::walk_sources;
@@ -50,7 +50,7 @@ const SKIP_FILES: &[&str] = &[
 struct Rule {
     kind: &'static str,
     check: NoticeCheck,
-    re: Regex,
+    pattern: &'static str,
 }
 
 fn rules() -> &'static [Rule] {
@@ -116,22 +116,37 @@ fn rules() -> &'static [Rule] {
     &RULES
 }
 
-fn rule(kind: &'static str, check: NoticeCheck, pattern: &str) -> Rule {
+fn rule(kind: &'static str, check: NoticeCheck, pattern: &'static str) -> Rule {
     Rule {
         kind,
         check,
-        re: Regex::new(pattern).unwrap(),
+        pattern,
     }
 }
 
 /// Assignment-shaped credentials: `password = "..."`, `api_key: '...'`.
-/// Placeholders (`xxx`, `changeme`, ...) are excluded by value.
-static ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?i)\b(password|passwd|pwd|secret|api[_-]?key|apikey|auth[_-]?token|access[_-]?token)\b\s*[:=]\s*['"]([^'"]{4,})['"]"#,
-    )
-    .unwrap()
-});
+/// Placeholders (`xxx`, `changeme`, ...) are excluded by value. The
+/// set carries the same pattern as a prefilter; captures need the
+/// real regex, run only on prefilter hits.
+const ASSIGN_PATTERN: &str = r#"(?i)\b(password|passwd|pwd|secret|api[_-]?key|apikey|auth[_-]?token|access[_-]?token)\b\s*[:=]\s*['"]([^'"]{4,})['"]"#;
+static ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(ASSIGN_PATTERN).unwrap());
+
+/// One-pass prefilter over all rule patterns plus the assignment shape:
+/// a single scan per line reports which rules matched, replacing one
+/// pass per rule. Built from `rules()` so indices always align with
+/// rule order; index `rules().len()` is the assignment prefilter.
+fn rule_set() -> &'static RegexSet {
+    static SET: LazyLock<RegexSet> = LazyLock::new(|| {
+        RegexSet::new(
+            rules()
+                .iter()
+                .map(|r| r.pattern)
+                .chain(std::iter::once(ASSIGN_PATTERN)),
+        )
+        .unwrap()
+    });
+    &SET
+}
 
 /// Candidate generated tokens for the entropy fallback.
 static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/=_-]{20,}").unwrap());
@@ -166,7 +181,10 @@ const ENTROPY_BITS: f64 = 4.5;
 
 /// Scan the project for secrets and crypto issues. One notice per
 /// (file, line, check); files are deduplicated by scan order.
-pub fn scan_project(root: &Path) -> Vec<Notice> {
+/// `done` holds files already scanned by an ancestor project (nested
+/// projects share subtrees): they are skipped, and every scanned file
+/// is recorded so descendants skip them too.
+pub fn scan_project(root: &Path, done: &mut HashSet<PathBuf>) -> Vec<Notice> {
     let files = walk_sources(root, SECRET_EXTS);
     if files.len() > 500 {
         crate::progress::note(&format!(
@@ -177,6 +195,10 @@ pub fn scan_project(root: &Path) -> Vec<Notice> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for path in &files {
+        // Already covered by an ancestor project's scan.
+        if !done.insert(path.clone()) {
+            continue;
+        }
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -220,23 +242,28 @@ struct Finding {
 /// token yields one notice).
 fn scan_line(line: &str) -> Vec<Finding> {
     let mut out = Vec::new();
-    for rule in rules() {
-        if rule.re.is_match(line) {
-            // `ARC4` also matches `arc4random` (a fine CSPRNG): exclude it.
-            if rule.kind.ends_with("RC4") && line.to_lowercase().contains("arc4random") {
-                continue;
-            }
-            let message = match rule.check {
-                NoticeCheck::Secrets => format!("possible secret: {}", rule.kind),
-                _ => rule.kind.to_string(),
-            };
-            out.push(Finding {
-                check: rule.check,
-                message,
-            });
+    let assign_idx = rules().len();
+    let mut assign_hit = false;
+    for idx in rule_set().matches(line) {
+        if idx == assign_idx {
+            assign_hit = true;
+            continue;
         }
+        let rule = &rules()[idx];
+        // `ARC4` also matches `arc4random` (a fine CSPRNG): exclude it.
+        if rule.kind.ends_with("RC4") && line.to_lowercase().contains("arc4random") {
+            continue;
+        }
+        let message = match rule.check {
+            NoticeCheck::Secrets => format!("possible secret: {}", rule.kind),
+            _ => rule.kind.to_string(),
+        };
+        out.push(Finding {
+            check: rule.check,
+            message,
+        });
     }
-    if let Some(caps) = ASSIGN_RE.captures(line) {
+    if assign_hit && let Some(caps) = ASSIGN_RE.captures(line) {
         let value = caps.get(2).unwrap().as_str();
         // Real credentials never contain whitespace; prose does.
         if !value.chars().any(|c| c.is_whitespace()) && !is_placeholder(value) {
@@ -295,14 +322,14 @@ fn looks_generated(token: &str) -> bool {
     if token.len() < 20 || token.len() > 256 {
         return false;
     }
+    // Base64 pads with trailing `=` only; `=` mid-token means `flag=value`.
+    if token.trim_end_matches('=').contains('=') {
+        return false;
+    }
     if token.chars().all(|c| c.is_ascii_hexdigit()) {
         return false; // content hash, not a credential
     }
     if is_uuid(token) {
-        return false;
-    }
-    // Base64 pads with trailing `=` only; `=` mid-token means `flag=value`.
-    if token.trim_end_matches('=').contains('=') {
         return false;
     }
     if ALPHABETS
@@ -315,12 +342,16 @@ fn looks_generated(token: &str) -> bool {
 }
 
 fn is_uuid(token: &str) -> bool {
-    let parts: Vec<&str> = token.split('-').collect();
-    parts.len() == 5
-        && [8, 4, 4, 4, 12]
-            .iter()
-            .zip(parts.iter())
-            .all(|(len, part)| part.len() == *len && part.chars().all(|c| c.is_ascii_hexdigit()))
+    // 8-4-4-4-12 hex with dashes at 8/13/18/23; no allocation.
+    token.len() == 36
+        && token.as_bytes()[8] == b'-'
+        && token.as_bytes()[13] == b'-'
+        && token.as_bytes()[18] == b'-'
+        && token.as_bytes()[23] == b'-'
+        && token
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| matches!(i, 8 | 13 | 18 | 23) || b.is_ascii_hexdigit())
 }
 
 fn shannon_entropy(token: &str) -> f64 {
@@ -431,7 +462,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("app.py"), "x = \"AKIAIOSFODNN7EXAMPLE\"\n").unwrap();
-        let notices = scan_project(dir.path());
+        let notices = scan_project(dir.path(), &mut HashSet::new());
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].file.as_deref(), Some("app.py"));
     }

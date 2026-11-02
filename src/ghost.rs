@@ -148,53 +148,64 @@ pub fn python_imports(text: &str) -> Vec<(String, u32)> {
 /// `import ... from 'x'`, `export ... from 'x'`, `require('x')`,
 /// `import('x')`. Relative paths are first-party and skipped.
 pub fn node_imports(text: &str) -> Vec<(String, u32)> {
-    static FROM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(
-            r#"(?:import\s*['"]([^'"]+)['"]|(?:import|export)[^'"]*?from\s*['"]([^'"]+)['"])"#,
-        )
+    // One pass per line: side-effect imports, `from` imports/exports,
+    // `require`/`import()` calls, and multi-line `} from "x"` closers
+    // (the closing line carries `from` without the `import` keyword;
+    // `} from "x"` is unambiguous). `^` anchors the line haystack.
+    static COMBINED_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r#"(?:import\s*['"](?P<side>[^'"]+)['"]"#,
+            r#"|(?:import|export)[^'"]*?from\s*['"](?P<from>[^'"]+)['"]"#,
+            r#"|(?:require|import)\s*\(\s*['"](?P<reqspec>[^'"]+)['"]"#,
+            r#"|^\s*\}\s*from\s*['"](?P<multi>[^'"]+)['"])"#,
+        ))
         .unwrap()
-    });
-    static REQ_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?:require|import)\s*\(\s*['"]([^'"]+)['"]"#).unwrap()
-    });
-    // Multi-line `import { ... } from "spec"`: the closing line carries
-    // `from` without the `import` keyword. `} from "x"` is unambiguous.
-    static MULTILINE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"^\s*\}\s*from\s*['"]([^'"]+)['"]"#).unwrap()
     });
     let mut out = Vec::new();
     for (idx, raw) in text.lines().enumerate() {
+        // Every branch needs one of these literals; memchr-fast reject.
+        if !raw.contains("import")
+            && !raw.contains("export")
+            && !raw.contains("require")
+            && !raw.contains("from")
+        {
+            continue;
+        }
         let line = raw.split("//").next().unwrap_or("");
-        for caps in MULTILINE_RE.captures_iter(line) {
-            let spec = caps.get(1).unwrap().as_str().to_string();
-            if !spec.starts_with('.') && !spec.starts_with('/') && !spec.is_empty() {
-                out.push((spec, idx as u32 + 1));
-            }
-        }
-        for caps in FROM_RE.captures_iter(line) {
+        for caps in COMBINED_RE.captures_iter(line) {
             let spec = caps
-                .get(1)
-                .or_else(|| caps.get(2))
-                .unwrap()
-                .as_str()
-                .to_string();
-            if !spec.starts_with('.') && !spec.starts_with('/') && !spec.is_empty() {
-                out.push((spec, idx as u32 + 1));
-            }
-        }
-        for caps in REQ_RE.captures_iter(line) {
+                .name("side")
+                .or_else(|| caps.name("from"))
+                .or_else(|| caps.name("multi"))
+                .or_else(|| caps.name("reqspec"));
+            let Some(spec) = spec else { continue };
             // `require(`/`import(` as a method call (`ObjC.import("x")`
             // in a JXA template string) is not a module load.
-            let start = caps.get(0).unwrap().start();
-            if start > 0
-                && let Some(prev) = line[..start].chars().last()
-                && (prev.is_alphanumeric() || matches!(prev, '_' | '$' | '.'))
-            {
-                continue;
+            if caps.name("reqspec").is_some() {
+                let start = caps.get(0).unwrap().start();
+                if start > 0
+                    && let Some(prev) = line[..start].chars().last()
+                    && (prev.is_alphanumeric() || matches!(prev, '_' | '$' | '.'))
+                {
+                    continue;
+                }
             }
-            let spec = caps.get(1).unwrap().as_str().to_string();
+            // Side-effect `import` must be a standalone keyword:
+            // `value="import" class="…"` (JSX), `"agents-import", …`
+            // (strings), and `` `import "…" `` (templates) are not imports.
+            if caps.name("side").is_some() {
+                let start = caps.get(0).unwrap().start();
+                if start > 0
+                    && let Some(prev) = line[..start].chars().last()
+                    && (prev.is_alphanumeric()
+                        || matches!(prev, '_' | '$' | '.' | '"' | '\'' | '`' | '-' | '/' | ':'))
+                {
+                    continue;
+                }
+            }
+            let spec = spec.as_str();
             if !spec.starts_with('.') && !spec.starts_with('/') && !spec.is_empty() {
-                out.push((spec, idx as u32 + 1));
+                out.push((spec.to_string(), idx as u32 + 1));
             }
         }
     }
@@ -684,6 +695,21 @@ mod tests {
         assert_eq!(node_package("@scope/pkg/sub"), "@scope/pkg");
         assert_eq!(node_package("lodash/fp"), "lodash");
         assert_eq!(node_package("node:fs"), "fs");
+    }
+
+    #[test]
+    fn node_side_effect_import_needs_keyword_boundary() {
+        // `import"` inside JSX attributes, strings, and template
+        // literals is not a side-effect import.
+        let src = "import 'real-side-effect';\n<Tabs.Content value=\"import\" class=\"x\" data-tab=\"import\">\nreplaceAgents(\"agents-import\", [a], \"agents.imported\");\n`import \"${s}\";`\n} from 'multiline-pkg';\n";
+        let got = node_imports(src);
+        assert_eq!(
+            got,
+            vec![
+                ("real-side-effect".to_string(), 1),
+                ("multiline-pkg".to_string(), 5),
+            ]
+        );
     }
 
     #[test]

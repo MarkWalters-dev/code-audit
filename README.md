@@ -20,11 +20,12 @@ Requires the Rust toolchain (https://rustup.rs/):
 cargo install --path .
 ```
 
-Or build and run directly:
+Or build and run directly (always use `--release` outside development —
+the local scans are regex-heavy and debug builds run several times slower):
 
 ```sh
-cargo build
-./target/debug/depaudit /path/to/project
+cargo build --release
+./target/release/depaudit /path/to/project
 ```
 
 ## Usage
