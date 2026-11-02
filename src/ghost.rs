@@ -149,8 +149,10 @@ pub fn python_imports(text: &str) -> Vec<(String, u32)> {
 /// `import('x')`. Relative paths are first-party and skipped.
 pub fn node_imports(text: &str) -> Vec<(String, u32)> {
     static FROM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?:import\s*['"]([^'"]+)['"]|(?:import|export)[^'"]*?from\s*['"]([^'"]+)['"])"#)
-            .unwrap()
+        regex::Regex::new(
+            r#"(?:import\s*['"]([^'"]+)['"]|(?:import|export)[^'"]*?from\s*['"]([^'"]+)['"])"#,
+        )
+        .unwrap()
     });
     static REQ_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"(?:require|import)\s*\(\s*['"]([^'"]+)['"]"#).unwrap()

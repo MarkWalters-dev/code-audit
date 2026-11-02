@@ -74,13 +74,21 @@ impl EcosystemChecker for Python {
         if let Some(deps) = enumerate_installed(root)
             && !deps.is_empty()
         {
-            return Ok(Inventory { deps, gaps, notes: Vec::new() });
+            return Ok(Inventory {
+                deps,
+                gaps,
+                notes: Vec::new(),
+            });
         }
         for lock in ["uv.lock", "poetry.lock", "pdm.lock"] {
             let path = root.join(lock);
             if path.is_file() {
                 let deps = parse_lockfile(&path);
-                return Ok(Inventory { deps, gaps, notes: Vec::new() });
+                return Ok(Inventory {
+                    deps,
+                    gaps,
+                    notes: Vec::new(),
+                });
             }
         }
         let mut deps = Vec::new();
@@ -100,7 +108,11 @@ impl EcosystemChecker for Python {
         let mut deps: Vec<Dep> = by_name.into_values().collect();
         deps.sort_by(|a, b| a.name.cmp(&b.name));
         gaps.extend(setup_py_gaps(root));
-        Ok(Inventory { deps, gaps, notes: Vec::new() })
+        Ok(Inventory {
+            deps,
+            gaps,
+            notes: Vec::new(),
+        })
     }
 
     fn fetch_latest(&self, _ctx: &Ctx, dep: &Dep) -> Result<LatestInfo, String> {

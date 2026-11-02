@@ -1956,7 +1956,9 @@ fn gradle_lint_inner(root: &Path) -> Result<Vec<LintFinding>, String> {
     let Some(mut cmd) = gradle_wrapper(root) else {
         return Err("no gradle wrapper found; gradle lint needs ./gradlew".to_string());
     };
-    crate::progress::note("depaudit: running ./gradlew lint (first run downloads Gradle and dependencies)...");
+    crate::progress::note(
+        "depaudit: running ./gradlew lint (first run downloads Gradle and dependencies)...",
+    );
     cmd.arg("lint").arg("--console=plain");
     let out = run_command(cmd, GRADLE_TIMEOUT).map_err(|e| format!("gradle lint failed: {e}"))?;
     let mut findings = Vec::new();

@@ -22,10 +22,9 @@ use crate::ghost::walk_sources;
 
 /// Source and config extensions worth scanning.
 const SECRET_EXTS: &[&str] = &[
-    "py", "js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts", "rb", "php", "sh", "bash",
-    "zsh", "env", "json", "yaml", "yml", "toml", "ini", "cfg", "conf", "xml", "html", "htm",
-    "java", "kt", "kts", "go", "rs", "c", "h", "cpp", "hpp", "cs", "swift", "tf", "ps1",
-    "pl",
+    "py", "js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts", "rb", "php", "sh", "bash", "zsh",
+    "env", "json", "yaml", "yml", "toml", "ini", "cfg", "conf", "xml", "html", "htm", "java", "kt",
+    "kts", "go", "rs", "c", "h", "cpp", "hpp", "cs", "swift", "tf", "ps1", "pl",
 ];
 
 /// Lockfiles and registries: hashes by design, never scan them.
@@ -87,12 +86,12 @@ fn rules() -> &'static [Rule] {
             rule(
                 "deprecated crypto: MD5",
                 crypto,
-                r#"(?i)\bmd5\s*\(|hashlib\.md5|getInstance\s*\(\s*['"]MD5['"]|createHash\s*\(\s*['"]md5['"]"#
+                r#"(?i)\bmd5\s*\(|hashlib\.md5|getInstance\s*\(\s*['"]MD5['"]|createHash\s*\(\s*['"]md5['"]"#,
             ),
             rule(
                 "deprecated crypto: SHA-1",
                 crypto,
-                r#"(?i)\bsha-?1\s*\(|hashlib\.sha1|getInstance\s*\(\s*['"]SHA-?1['"]|createHash\s*\(\s*['"]sha1['"]|\bsha1\s*\.\s*(New|Sum)"#
+                r#"(?i)\bsha-?1\s*\(|hashlib\.sha1|getInstance\s*\(\s*['"]SHA-?1['"]|createHash\s*\(\s*['"]sha1['"]|\bsha1\s*\.\s*(New|Sum)"#,
             ),
             rule(
                 "deprecated crypto: DES",
@@ -100,11 +99,7 @@ fn rules() -> &'static [Rule] {
                 r"(?i)DES/ECB|DESede|TripleDES|Cipher[^;]*DES[^;]*\)",
             ),
             rule("deprecated crypto: ECB mode", crypto, r"\bECB\b"),
-            rule(
-                "deprecated crypto: RC4",
-                crypto,
-                r"(?i)\brc4\b|ARC4",
-            ),
+            rule("deprecated crypto: RC4", crypto, r"(?i)\brc4\b|ARC4"),
             rule(
                 "deprecated crypto: createCipher",
                 crypto,
@@ -139,14 +134,31 @@ static ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Candidate generated tokens for the entropy fallback.
-static TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/=_-]{20,}").unwrap());
+static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z0-9+/=_-]{20,}").unwrap());
 
 /// Placeholder credential values that are never findings.
 const PLACEHOLDERS: &[&str] = &[
-    "xxx", "xxxx", "test", "testing", "example", "changeme", "change-me", "password", "secret",
-    "apikey", "api-key", "yourkey", "your-key", "todo", "none", "null", "undefined", "***",
-    "ppp", "1234", "12345",
+    "xxx",
+    "xxxx",
+    "test",
+    "testing",
+    "example",
+    "changeme",
+    "change-me",
+    "password",
+    "secret",
+    "apikey",
+    "api-key",
+    "yourkey",
+    "your-key",
+    "todo",
+    "none",
+    "null",
+    "undefined",
+    "***",
+    "ppp",
+    "1234",
+    "12345",
 ];
 
 /// Minimum Shannon entropy (bits/char) for the high-entropy fallback.
@@ -194,7 +206,7 @@ pub fn scan_project(root: &Path) -> Vec<Notice> {
             }
         }
     }
-    out.sort_by(|a, b| (a.file.clone(), a.line).cmp(&(b.file.clone(), b.line)));
+    out.sort_by_key(|a| (a.file.clone(), a.line));
     out
 }
 
@@ -257,7 +269,10 @@ fn scan_line(line: &str) -> Vec<Finding> {
 /// Placeholder or obviously-fake credential value.
 fn is_placeholder(value: &str) -> bool {
     let lower = value.to_lowercase();
-    if PLACEHOLDERS.iter().any(|p| lower == *p || lower.contains(p)) {
+    if PLACEHOLDERS
+        .iter()
+        .any(|p| lower == *p || lower.contains(p))
+    {
         return true;
     }
     // `***`, `xxx...`, single-char runs.
@@ -305,9 +320,7 @@ fn is_uuid(token: &str) -> bool {
         && [8, 4, 4, 4, 12]
             .iter()
             .zip(parts.iter())
-            .all(|(len, part)| {
-                part.len() == *len && part.chars().all(|c| c.is_ascii_hexdigit())
-            })
+            .all(|(len, part)| part.len() == *len && part.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn shannon_entropy(token: &str) -> f64 {
@@ -372,12 +385,22 @@ mod tests {
             vec![NoticeCheck::Secrets]
         );
         // sha256 hex, UUID, prose: silent.
-        assert!(kinds("sha = \"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\"").is_empty());
+        assert!(
+            kinds("sha = \"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\"")
+                .is_empty()
+        );
         assert!(kinds("id = \"123e4567-e89b-12d3-a456-426614174000\"").is_empty());
         assert!(kinds("# just a comment about nothing important here").is_empty());
         // CLI flag blobs, encoding alphabets, prose assignments: silent.
-        assert!(kinds("\"build\": \"NODE_OPTIONS=--max-old-space-size=6144 vite build\"").is_empty());
-        assert!(kinds("const a = \"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_\";").is_empty());
+        assert!(
+            kinds("\"build\": \"NODE_OPTIONS=--max-old-space-size=6144 vite build\"").is_empty()
+        );
+        assert!(
+            kinds(
+                "const a = \"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_\";"
+            )
+            .is_empty()
+        );
         assert!(kinds("secret: \"Credentials and keys are not allowed here.\"").is_empty());
     }
 

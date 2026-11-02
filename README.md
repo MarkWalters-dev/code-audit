@@ -39,6 +39,7 @@ Options:
       --vulns-only       Only check for vulnerabilities
       --lint-only        Only run linters
       --no-lint          Skip linters
+      --sbom             CycloneDX SBOM (JSON) to stdout instead of the report
       --deep             Include transitive/indirect deps in the outdated check
                          (vulnerabilities always cover every known dependency)
       --json             Machine-readable report
@@ -48,7 +49,12 @@ Options:
       --no-cache         Bypass the disk cache
       --clear-cache      Clear the disk cache before auditing
   -v, --verbose          Print extra progress information
+  -q, --quiet            Silence progress output (reports still print)
 ```
+
+Progress goes to stderr (`depaudit: checking …`, per-linter
+announcements, `depaudit: done in …`), so stdout stays clean for
+`--json` / `--sbom` piping; `-q` silences it.
 
 Examples:
 
@@ -82,7 +88,7 @@ are audited once at the top instead of twice.
 | Ecosystem | Inventory from | Latest from | Current version when ambiguous |
 |---|---|---|---|
 | Python | installed `dist-info` (`.venv`/`VIRTUAL_ENV`), else `uv/poetry/pdm.lock`, else `requirements*.txt`, `pyproject.toml`, `Pipfile` | PyPI JSON API | unpinned specs resolve to what `pip install` would pick |
-| JavaScript | `package.json` + `node_modules`, `package-lock.json` | npm registry `/latest` | exact specs count as versions; ranges resolve by satisfaction |
+| JavaScript | `package.json` + `node_modules`, lockfiles (`package-lock` → `pnpm-lock` → `bun.lock` → `yarn.lock`) | npm registry `/latest` | exact specs count as versions; ranges resolve by satisfaction |
 | Rust | `Cargo.toml` (workspace-aware) + `Cargo.lock` | crates.io API | requirements resolve to newest matching non-yanked release |
 | Go | `go.mod` requires (+ `replace`, `GOPRIVATE` honored) | Go module proxy `@v/list` | always pinned in `go.mod` |
 | Android | `libs.versions.toml`, `build.gradle(.kts)`, known plugin ids | Maven Central + Google Maven | always pinned (dynamic versions skipped) |
@@ -115,6 +121,16 @@ All registry reads are retried with backoff (4 attempts; non-429 client
 errors fail fast) behind a 6-request concurrency cap, so burst
 throttling and transient DNS failures ride through instead of becoming
 `could not check` gaps.
+
+JavaScript lockfiles resolve in order `package-lock.json` →
+`pnpm-lock.yaml` (nearest up, importer-aware, so workspace members pin
+correctly) → `bun.lock` (JSONC, workspace-aware) → `yarn.lock` (v1 and
+berry). `catalog:` / `catalog:<name>` specs resolve through
+`pnpm-workspace.yaml` and the workspace root `package.json`; `patch:`
+suffixed versions compare by their base version. First-party
+`workspace:*` / `link:` / `file:` specs are skipped with a note, not
+flagged as gaps. `bun.lockb` is binary with no stable spec and is never
+parsed — when it is the only lockfile that is named as a gap.
 
 ## Sample output
 
@@ -165,6 +181,13 @@ channel manifest, the Gradle version service, and Maven metadata (Kotlin).
 For Python, Node and Go the report also flags end-of-life releases, e.g.
 `node (engines) >=18 -> 26.13.0 (end-of-life since 2025-04-30)`.
 (Vite, AGP and similar are regular dependencies and show up as libraries.)
+
+Separately, **drift** notices compare toolchain pin files against the
+host's active binaries: `.nvmrc` / `.node-version` vs `node`,
+`.python-version` vs `python3`, `go.mod` vs `go`, `rust-toolchain.toml`
+vs `rustc`. Only numeric pins are compared (`stable` / `lts/*` stay
+silent, as do missing host binaries), e.g.
+`.nvmrc pins node 18, host node is 26.12.1  (drift)`.
 
 ## Unchecked dependencies (gaps)
 
@@ -362,10 +385,12 @@ partial build caches still speed up the next run.
     bad.py:2:8  [F401] `sys` imported but unused  (ruff)
 ```
 
-## Notices: licenses, yanked, end-of-life
+## Notices: licenses, yanked, end-of-life, and more
 
-Every audited dependency also gets three metadata checks, reported as
-`notices:` lines (and a `notices` count in the header):
+Every audited dependency also gets metadata checks, reported as
+`notices:` lines (and a `notices` count in the header). The
+project-level checks (secrets, crypto, dead code, drift, zombie assets)
+run once per project with no network and no cache:
 
 - **licenses**: each dependency's SPDX license is resolved and matched
   against `[licenses] deny`. Family prefixes match (`GPL` denies
@@ -377,8 +402,9 @@ Every audited dependency also gets three metadata checks, reported as
   (Django, React, Angular, Vue, Next.js, Nuxt) warn once their release
   cycle passes end-of-life.
 - **bloat**: packages locked at more than one version (Rust `Cargo.lock`,
-  npm `package-lock.json` at every nesting depth), each copy installed —
-  and for compiled languages, built and shipped — separately.
+  npm `package-lock.json` at every nesting depth, pnpm/yarn/bun
+  workspace merges), each copy installed — and for compiled languages,
+  built and shipped — separately.
 - **license-change**: the newest release carries a different license set
   than the used version (upstream relicensed). Both ends must be known;
   unknown on either side stays silent.
@@ -389,6 +415,20 @@ Every audited dependency also gets three metadata checks, reported as
   Python import aliases (`yaml` → `pyyaml`, `PIL` → `pillow`) resolve
   through a built-in map, and Kotlin uses a conservative token-overlap
   heuristic since packages do not name their artifact.
+- **secrets**: hardcoded tokens (AWS, GitHub, Slack, Google, private
+  keys, …) via known-shape rules plus an entropy fallback for assigned
+  string literals. Precision over recall: lockfiles, alphabets, and
+  prose-looking strings are filtered out.
+- **crypto**: deprecated primitives in source — MD5, SHA-1, DES, ECB
+  mode, RC4, `createCipher` — and TLS-verification disables.
+- **dead-code**: source files nothing imports and media/font assets
+  nothing references (zombie assets). Framework entries are honored:
+  file routers (`pages/`, `routes/`, expo `app/`), stories, fixtures,
+  tests, `scripts/`, shebang CLIs, `package.json` `bin`/script targets,
+  manifest entries, tsconfig aliases, Metro platform variants
+  (`.ios`/`.android`/`.native`), and references from JSON/HTML
+  (`app.json` plugins, `index.html` entry scripts). When in doubt a
+  file is called live — a notice is a prompt to look, not proof.
 
 License sources are the registries themselves, never guesses: PyPI
 version documents (classifiers + `license` + yank flag), npm version
@@ -417,7 +457,10 @@ ratings and fixed versions.
   a gap when it is the only lockfile); everything else resolves versions
   from `package-lock.json`, `pnpm-lock.yaml` (workspace-aware, `catalog:`
   specs resolved), `bun.lock`, or `yarn.lock`, in that order.
-- Network access to the public registries and OSV is required.
+- Fresh audits need network access to the public registries and OSV;
+  repeat audits degrade to stale cache per dependency when offline
+  (see Caching), and the project-level checks (drift, secrets, crypto,
+  dead code, ghost) never need the network at all.
 
 ## Development
 

@@ -165,7 +165,11 @@ impl EcosystemChecker for RustLang {
 
         let mut deps: Vec<Dep> = by_name.into_values().collect();
         deps.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Inventory { deps, gaps, notes: Vec::new() })
+        Ok(Inventory {
+            deps,
+            gaps,
+            notes: Vec::new(),
+        })
     }
 
     fn fetch_latest(&self, _ctx: &Ctx, dep: &Dep) -> Result<LatestInfo, String> {

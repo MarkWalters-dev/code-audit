@@ -457,7 +457,13 @@ fn python_pin(root: &Path) -> Option<(String, &'static str, u32)> {
         .next()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| (s.split(':').next().unwrap_or(s).to_string(), ".python-version", 1))
+        .map(|s| {
+            (
+                s.split(':').next().unwrap_or(s).to_string(),
+                ".python-version",
+                1,
+            )
+        })
 }
 
 /// The `go` directive's version plus its line number.
@@ -540,7 +546,8 @@ fn mise_pin_line(root: &Path, tool: &str) -> u32 {
         };
         for (i, line) in text.lines().enumerate() {
             let stripped: String = line.split_whitespace().collect();
-            if stripped.starts_with(&format!("{tool}=")) || stripped.starts_with(&format!("\"{tool}\"="))
+            if stripped.starts_with(&format!("{tool}="))
+                || stripped.starts_with(&format!("\"{tool}\"="))
             {
                 return i as u32 + 1;
             }
@@ -552,7 +559,10 @@ fn mise_pin_line(root: &Path, tool: &str) -> u32 {
 /// Host binary's version (`rustc 1.82.0 ...` -> `1.82.0`); `None` when
 /// the binary is missing or its output has no version.
 fn host_version(program: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program).args(args).output().ok()?;
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
     let text = format!(
         "{} {}",
         String::from_utf8_lossy(&output.stdout),
@@ -592,9 +602,7 @@ fn version_drift(want: &[u64], host: &str) -> bool {
                 .ok()
         })
         .collect();
-    want.iter()
-        .zip(have.iter())
-        .any(|(w, h)| w != h)
+    want.iter().zip(have.iter()).any(|(w, h)| w != h)
 }
 
 /// Today's date as `YYYY-MM-DD` (for EOL comparison; lexical compare works).
@@ -713,15 +721,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".nvmrc"), "20\n").unwrap();
         std::fs::write(dir.path().join("go.mod"), "module x\n\ngo 1.21\n").unwrap();
-        std::fs::write(dir.path().join("rust-toolchain.toml"), "[toolchain]\nchannel = \"1.82\"\n").unwrap();
-        assert_eq!(
-            node_pin(dir.path()),
-            Some(("20".to_string(), ".nvmrc", 1))
-        );
-        assert_eq!(
-            go_pin(dir.path()),
-            Some(("1.21".to_string(), "go.mod", 3))
-        );
+        std::fs::write(
+            dir.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.82\"\n",
+        )
+        .unwrap();
+        assert_eq!(node_pin(dir.path()), Some(("20".to_string(), ".nvmrc", 1)));
+        assert_eq!(go_pin(dir.path()), Some(("1.21".to_string(), "go.mod", 3)));
         assert_eq!(
             rust_pin(dir.path()),
             Some(("1.82".to_string(), "rust-toolchain.toml", 2))

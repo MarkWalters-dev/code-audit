@@ -177,7 +177,7 @@ pub fn node_dead(
         };
         if let Some(dir) = path.parent() {
             for spec in node_all_imports(&text) {
-                if let Some(target) = resolve_import(root, dir, &spec, aliases, &exts) {
+                for target in resolve_import(root, dir, &spec, aliases, &exts) {
                     used.insert(target);
                 }
             }
@@ -189,6 +189,14 @@ pub fn node_dead(
     for (_, text) in &texts {
         corpus.push_str(text);
         corpus.push('\n');
+    }
+    // Config/markup references count too (app.json plugins, index.html
+    // entry scripts, tsconfig file lists): corpus only, never candidates.
+    for path in walk_sources(root, &["json", "html", "htm"]) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            corpus.push_str(&text);
+            corpus.push('\n');
+        }
     }
     let mut out = Vec::new();
     for (path, text) in &texts {
@@ -207,6 +215,17 @@ pub fn node_dead(
             let total = corpus.matches(name).take(self_hits + 1).count();
             if total > self_hits {
                 continue;
+            }
+            // Extensionless refs (`./plugins/with-foo` in app.json):
+            // the stem must be long enough to not match prose by accident.
+            if let Some((stem, _)) = name.rsplit_once('.')
+                && stem.len() >= 8
+            {
+                let self_stem = text.matches(stem).count();
+                let total_stem = corpus.matches(stem).take(self_stem + 1).count();
+                if total_stem > self_stem {
+                    continue;
+                }
             }
         }
         out.push(dead_notice(
@@ -247,8 +266,7 @@ fn node_conventions(root: &Path, files: &[PathBuf]) -> NodeConventions {
             || d.join("nuxt.config.js").is_file()
             || d.join("nuxt.config.mjs").is_file()
     };
-    let nuxt =
-        has_nuxt_config(root) || find_manifest_dirs(root, &has_nuxt_config).len() > 1;
+    let nuxt = has_nuxt_config(root) || find_manifest_dirs(root, &has_nuxt_config).len() > 1;
     NodeConventions { router_roots, nuxt }
 }
 
@@ -316,7 +334,13 @@ fn is_node_entry(path: &Path, text: &str, conventions: &NodeConventions) -> bool
         if conventions.nuxt
             && matches!(
                 lower.as_str(),
-                "components" | "composables" | "utils" | "layouts" | "middleware" | "plugins" | "server"
+                "components"
+                    | "composables"
+                    | "utils"
+                    | "layouts"
+                    | "middleware"
+                    | "plugins"
+                    | "server"
             )
         {
             return true;
@@ -334,7 +358,14 @@ fn is_node_entry(path: &Path, text: &str, conventions: &NodeConventions) -> bool
     if (under_app
         && matches!(
             stem,
-            "page" | "layout" | "loading" | "error" | "not-found" | "route" | "template" | "default"
+            "page"
+                | "layout"
+                | "loading"
+                | "error"
+                | "not-found"
+                | "route"
+                | "template"
+                | "default"
         ))
         || matches!(
             stem,
@@ -350,8 +381,10 @@ fn is_node_entry(path: &Path, text: &str, conventions: &NodeConventions) -> bool
 /// All static import specifiers, relative ones included.
 fn node_all_imports(text: &str) -> Vec<String> {
     static FROM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?:import\s*['"]([^'"]+)['"]|(?:import|export)[^'"]*?from\s*['"]([^'"]+)['"])"#)
-            .unwrap()
+        regex::Regex::new(
+            r#"(?:import\s*['"]([^'"]+)['"]|(?:import|export)[^'"]*?from\s*['"]([^'"]+)['"])"#,
+        )
+        .unwrap()
     });
     static REQ_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r#"(?:require|import)\s*\(\s*['"]([^'"]+)['"]"#).unwrap()
@@ -408,24 +441,31 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
-/// Resolve an import to a source file: relative paths against the
+/// Resolve an import to live source files: relative paths against the
 /// importer dir, aliases through tsconfig targets, bare package
-/// imports to nothing (not first-party files).
+/// imports to nothing (not first-party files). The primary hit plus
+/// any Metro platform variants (`x.ios.*`, …) all count as live.
 fn resolve_import(
     root: &Path,
     importer_dir: &Path,
     spec: &str,
     aliases: &[(String, Vec<String>)],
     exts: &[&str],
-) -> Option<PathBuf> {
+) -> Vec<PathBuf> {
+    fn collect(base: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
+        if let Some(found) = resolve_file(base, exts) {
+            out.push(found);
+        }
+        out.extend(platform_variants(base, exts));
+    }
+    let mut out = Vec::new();
     if spec.starts_with('.') {
-        return resolve_file(&normalize_lexical(&importer_dir.join(spec)), exts);
+        collect(&normalize_lexical(&importer_dir.join(spec)), exts, &mut out);
+        return out;
     }
     // `~/...` (nuxt/vite convention) is scan-root relative.
     if let Some(rest) = spec.strip_prefix("~/") {
-        if let Some(found) = resolve_file(&root.join(rest), exts) {
-            return Some(found);
-        }
+        collect(&root.join(rest), exts, &mut out);
     }
     for (prefix, targets) in aliases {
         let rest = if spec == prefix {
@@ -443,29 +483,44 @@ fn resolve_import(
             } else {
                 root.join(mapped.trim_start_matches("./"))
             };
-            if let Some(found) = resolve_file(&base, exts) {
-                return Some(found);
-            }
+            collect(&base, exts, &mut out);
         }
     }
-    None
+    out
 }
 
 /// A path with extension probing (`x`, `x.ts`, `x/index.ts`, ...).
+/// Probe order matters: exact, then appended, then replaced. A dotted
+/// spec (`./foo.types` -> `foo.types.ts`) must not resolve to the
+/// sibling `foo.ts` via extension replacement.
 fn resolve_file(base: &Path, exts: &[&str]) -> Option<PathBuf> {
     if base.is_file() {
         return Some(base.to_path_buf());
     }
-    for ext in exts {
-        let with_ext = base.with_extension(ext);
-        // `with_extension` replaces; also try appending for extensionless.
-        if with_ext.is_file() {
-            return Some(with_ext);
+    if base.extension().is_none() {
+        // Extensionless: append and replace coincide (`x` -> `x.ts`).
+        for ext in exts {
+            let appended =
+                PathBuf::from(base.as_os_str().to_string_lossy().into_owned() + "." + ext);
+            if appended.is_file() {
+                return Some(appended);
+            }
         }
-        let appended = base.as_os_str().to_string_lossy().into_owned() + "." + ext;
-        let appended = PathBuf::from(appended);
-        if appended.is_file() {
-            return Some(appended);
+    } else {
+        // Dotted spec: appended first (`x.types` -> `x.types.ts`),
+        // replaced second (`x.js` -> `x.ts`, TS source for JS output).
+        for ext in exts {
+            let appended =
+                PathBuf::from(base.as_os_str().to_string_lossy().into_owned() + "." + ext);
+            if appended.is_file() {
+                return Some(appended);
+            }
+        }
+        for ext in exts {
+            let replaced = base.with_extension(ext);
+            if replaced.is_file() {
+                return Some(replaced);
+            }
         }
     }
     if base.is_dir() {
@@ -477,6 +532,27 @@ fn resolve_file(base: &Path, exts: &[&str]) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Metro/React Native platform variants of an extensionless base:
+/// `x` also brings `x.ios.*`, `x.android.*`, `x.native.*`, `x.web.*`
+/// to life. All existing variants are returned; liveness is a set.
+fn platform_variants(base: &Path, exts: &[&str]) -> Vec<PathBuf> {
+    const PLATS: &[&str] = &["ios", "android", "native", "web"];
+    if base.extension().is_some() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for plat in PLATS {
+        let stem = base.as_os_str().to_string_lossy().into_owned() + "." + plat;
+        for ext in exts {
+            let candidate = PathBuf::from(stem.clone() + "." + ext);
+            if candidate.is_file() {
+                out.push(candidate);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -625,9 +701,8 @@ pub fn android_dead(root: &Path) -> Vec<Notice> {
 /// Component simple names from every `AndroidManifest.xml`
 /// (`android:name`, relative names resolved against `package=`).
 fn manifest_classes(root: &Path) -> HashSet<String> {
-    static NAME_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"android:name="([^"]+)""#).unwrap()
-    });
+    static NAME_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"android:name="([^"]+)""#).unwrap());
     let mut out = HashSet::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -675,8 +750,8 @@ pub fn zombie_assets(root: &Path) -> Vec<Notice> {
     ];
     const SOURCE_EXTS: &[&str] = &[
         "py", "js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts", "rb", "php", "sh", "env",
-        "json", "yaml", "yml", "toml", "xml", "html", "htm", "css", "scss", "less", "md",
-        "txt", "rst", "java", "kt", "kts", "go", "rs", "gradle", "plist",
+        "json", "yaml", "yml", "toml", "xml", "html", "htm", "css", "scss", "less", "md", "txt",
+        "rst", "java", "kt", "kts", "go", "rs", "gradle", "plist",
     ];
     // Implicitly fetched: never flag these.
     const IMPLICIT: &[&str] = &["favicon.ico", "robots.txt", "CNAME", ".nojekyll"];
@@ -720,7 +795,11 @@ mod tests {
     #[test]
     fn python_flags_only_orphans() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("main.py"), "if __name__ == \"__main__\":\n    import used\n").unwrap();
+        std::fs::write(
+            dir.path().join("main.py"),
+            "if __name__ == \"__main__\":\n    import used\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("used.py"), "X = 1\n").unwrap();
         std::fs::write(dir.path().join("orphan.py"), "Y = 2\n").unwrap();
         std::fs::write(dir.path().join("test_orphan.py"), "Z = 3\n").unwrap();
@@ -731,7 +810,11 @@ mod tests {
     fn node_resolves_relative_and_aliases() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("index.js"), "import './src/used.js';\nimport '@/src/aliased.js';\n").unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            "import './src/used.js';\nimport '@/src/aliased.js';\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("src/used.js"), "export const a = 1;\n").unwrap();
         std::fs::write(dir.path().join("src/aliased.js"), "export const b = 2;\n").unwrap();
         std::fs::write(dir.path().join("src/dead.js"), "export const c = 3;\n").unwrap();
@@ -770,7 +853,10 @@ mod tests {
         let entries: HashSet<PathBuf> = HashSet::new();
         let notices = node_dead(dir.path(), &aliases, &entries);
         let dead = names(&notices);
-        assert!(!dead.contains(&"src/components/LandingPage.tsx"), "{dead:?}");
+        assert!(
+            !dead.contains(&"src/components/LandingPage.tsx"),
+            "{dead:?}"
+        );
         assert!(dead.contains(&"src/components/Dead.tsx"), "{dead:?}");
     }
 
@@ -808,7 +894,11 @@ mod tests {
         std::fs::write(root.join("scripts/seed.ts"), "console.log(1);\n").unwrap();
         std::fs::write(root.join("tests/x.test.ts"), "console.log(1);\n").unwrap();
         std::fs::write(root.join("foo.stories.tsx"), "export default 4;\n").unwrap();
-        std::fs::write(root.join("cli.mjs"), "#!/usr/bin/env node\nconsole.log(1);\n").unwrap();
+        std::fs::write(
+            root.join("cli.mjs"),
+            "#!/usr/bin/env node\nconsole.log(1);\n",
+        )
+        .unwrap();
         std::fs::write(root.join("worker.js"), "onmessage = 1;\n").unwrap();
         std::fs::write(
             root.join("main.js"),
@@ -838,12 +928,70 @@ mod tests {
     }
 
     #[test]
+    fn node_prefers_appended_over_replaced_extension() {
+        // `foo.types` must reach `foo.types.ts`, not the sibling `foo.ts`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "import \"./foo.types\";\n").unwrap();
+        std::fs::write(dir.path().join("foo.types.ts"), "export const t = 1;\n").unwrap();
+        std::fs::write(dir.path().join("foo.ts"), "export const f = 2;\n").unwrap();
+        let entries: HashSet<PathBuf> = [dir.path().join("a.ts")].into_iter().collect();
+        let notices = node_dead(dir.path(), &[], &entries);
+        assert_eq!(names(&notices), vec!["foo.ts"]);
+    }
+
+    #[test]
+    fn node_marks_platform_variants_live() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.ts"), "import \"./button\";\n").unwrap();
+        std::fs::write(dir.path().join("button.ios.tsx"), "export const b = 1;\n").unwrap();
+        std::fs::write(
+            dir.path().join("button.android.tsx"),
+            "export const b = 2;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("dead.tsx"), "export const d = 3;\n").unwrap();
+        let entries: HashSet<PathBuf> = [dir.path().join("a.ts")].into_iter().collect();
+        let notices = node_dead(dir.path(), &[], &entries);
+        assert_eq!(names(&notices), vec!["dead.tsx"]);
+    }
+
+    #[test]
+    fn node_sees_json_and_html_references() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<script src=\"/src/main.tsx\"></script>\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.tsx"), "console.log(1);\n").unwrap();
+        std::fs::write(
+            dir.path().join("app.json"),
+            "{\"plugins\":[\"./plugins/with-long-name\"]}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("plugins")).unwrap();
+        std::fs::write(
+            dir.path().join("plugins/with-long-name.js"),
+            "module.exports = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("dead.js"), "export const d = 1;\n").unwrap();
+        let notices = node_dead(dir.path(), &[], &HashSet::new());
+        assert_eq!(names(&notices), vec!["dead.js"]);
+    }
+
+    #[test]
     fn go_skips_main_and_test_only() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("used")).unwrap();
         std::fs::create_dir_all(dir.path().join("dead")).unwrap();
         std::fs::create_dir_all(dir.path().join("testonly")).unwrap();
-        std::fs::write(dir.path().join("main.go"), "package main\n\nimport \"example.com/app/used\"\n\nfunc main() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("main.go"),
+            "package main\n\nimport \"example.com/app/used\"\n\nfunc main() {}\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("used/u.go"), "package used\n").unwrap();
         std::fs::write(dir.path().join("dead/d.go"), "package dead\n").unwrap();
         std::fs::write(dir.path().join("testonly/t_test.go"), "package testonly\n").unwrap();
@@ -859,7 +1007,11 @@ mod tests {
             "<manifest><application><activity android:name=\".MainActivity\" /></application></manifest>\n",
         )
         .unwrap();
-        std::fs::write(dir.path().join("MainActivity.kt"), "class MainActivity(val u: User)\n").unwrap();
+        std::fs::write(
+            dir.path().join("MainActivity.kt"),
+            "class MainActivity(val u: User)\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("Used.kt"), "class Used\n").unwrap();
         std::fs::write(dir.path().join("User.kt"), "class User(val u: Used)\n").unwrap();
         std::fs::write(dir.path().join("Dead.kt"), "class Dead\n").unwrap();

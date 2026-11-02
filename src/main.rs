@@ -17,8 +17,8 @@ mod progress;
 mod python;
 mod report;
 mod rustlang;
-mod secrets;
 mod sbom;
+mod secrets;
 mod toolchains;
 mod version;
 
@@ -187,13 +187,13 @@ fn run(args: cli::Args) -> i32 {
             let mut extra = toolchains::drift_notices(&proj.root);
             extra.extend(secrets::scan_project(&proj.root));
             extra.extend(deadcode::zombie_assets(&proj.root));
-            if !extra.is_empty() {
-                if let Some(first) = outcomes.first_mut() {
-                    first.notices.append(&mut extra);
-                    first
-                        .notices
-                        .sort_by(|a, b| (&a.check, &a.name).cmp(&(&b.check, &b.name)));
-                }
+            if !extra.is_empty()
+                && let Some(first) = outcomes.first_mut()
+            {
+                first.notices.append(&mut extra);
+                first
+                    .notices
+                    .sort_by(|a, b| (&a.check, &a.name).cmp(&(&b.check, &b.name)));
             }
         }
         reports.push((proj_str, outcomes));

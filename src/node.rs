@@ -44,11 +44,11 @@ impl EcosystemChecker for Node {
         // lockfile or install pins the version (both pnpm and bun agree
         // on the `catalog:` / `catalog:<name>` spellings).
         let mut catalogs = pnpm_catalogs(root);
-        if let Some(lock_path) = find_up(root, "bun.lock") {
-            if let Some(lock_dir) = lock_path.parent() {
-                for (k, v) in bun_catalogs(lock_dir) {
-                    catalogs.entry(k).or_insert(v);
-                }
+        if let Some(lock_path) = find_up(root, "bun.lock")
+            && let Some(lock_dir) = lock_path.parent()
+        {
+            for (k, v) in bun_catalogs(lock_dir) {
+                catalogs.entry(k).or_insert(v);
             }
         }
         let mut deps = Vec::new();
@@ -88,7 +88,8 @@ impl EcosystemChecker for Node {
         deps.sort_by(|a, b| a.name.cmp(&b.name));
         let mut notes = Vec::new();
         if first_party == 1 {
-            notes.push("1 first-party dependency skipped (workspace:/link:/file: spec)".to_string());
+            notes
+                .push("1 first-party dependency skipped (workspace:/link:/file: spec)".to_string());
         } else if first_party > 1 {
             notes.push(format!(
                 "{first_party} first-party dependencies skipped (workspace:/link:/file: specs)"
@@ -527,9 +528,7 @@ fn entry_candidates(dir: &Path, value: &str) -> Vec<PathBuf> {
 /// shell-splitter-separated words ending in a source extension.
 /// Flags, URLs, and bare package names never match the suffix test.
 fn script_file_refs(script: &str) -> Vec<String> {
-    const EXTS: &[&str] = &[
-        ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts",
-    ];
+    const EXTS: &[&str] = &[".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"];
     script
         .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ';' | '&' | '|' | '(' | ')'))
         .filter(|token| {
@@ -584,15 +583,15 @@ fn locked_versions(root: &Path) -> HashMap<String, String> {
     if !npm.is_empty() {
         return npm;
     }
-    if let Some(pnpm) = read_pnpm_lock(root) {
-        if !pnpm.is_empty() {
-            return pnpm;
-        }
+    if let Some(pnpm) = read_pnpm_lock(root)
+        && !pnpm.is_empty()
+    {
+        return pnpm;
     }
-    if let Some(bun) = read_bun_lock(root) {
-        if !bun.is_empty() {
-            return bun;
-        }
+    if let Some(bun) = read_bun_lock(root)
+        && !bun.is_empty()
+    {
+        return bun;
     }
     read_yarn_lock(root)
 }
@@ -651,7 +650,11 @@ fn yaml_scalar(raw: &str) -> String {
     if let Some(cut) = value.find(" #") {
         value = value[..cut].trim();
     }
-    value.trim_matches('"').trim_matches('\'').trim().to_string()
+    value
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string()
 }
 
 /// Locked versions from `pnpm-lock.yaml`'s `importers:` map for this
@@ -707,13 +710,14 @@ fn read_pnpm_lock(root: &Path) -> Option<HashMap<String, String>> {
             current_name = if name.is_empty() { None } else { Some(name) };
             continue;
         }
-        if indent >= 8 && let Some(name) = current_name.clone() {
-            if let Some(value) = line.strip_prefix("version:") {
-                if let Some(version) = clean_locked(&yaml_scalar(value)) {
-                    out.insert(name, version);
-                }
-                current_name = None;
+        if indent >= 8
+            && let Some(name) = current_name.clone()
+            && let Some(value) = line.strip_prefix("version:")
+        {
+            if let Some(version) = clean_locked(&yaml_scalar(value)) {
+                out.insert(name, version);
             }
+            current_name = None;
         }
     }
     Some(out)
