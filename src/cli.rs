@@ -2,19 +2,19 @@
 
 use clap::Parser;
 
-/// Check whether a project's dependencies are the latest versions.
+/// Audit a project's dependencies for outdated and vulnerable libraries.
 ///
 /// Detects the project type(s) in PATH (Python, JavaScript, Rust, Go, Android)
-/// and runs each ecosystem's own outdated-checker, installing it first when
-/// missing and allowed.
+/// and checks each dependency against its registry (latest release) and the
+/// OSV vulnerability database, then runs each ecosystem's linters.
 #[derive(Debug, Parser)]
-#[command(name = "freshdeps", version, about, long_about = None)]
+#[command(name = "depaudit", version, about, long_about = None)]
 pub struct Args {
-    /// Project directory to check.
+    /// Project directory to audit.
     #[arg(default_value = ".")]
     pub path: String,
 
-    /// Only check these ecosystems (comma-separated):
+    /// Only audit these ecosystems (comma-separated):
     /// python, node, rust, go, android.
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub only: Vec<String>,
@@ -23,15 +23,31 @@ pub struct Args {
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub exclude: Vec<String>,
 
-    /// Install missing checker tools without asking.
-    #[arg(short = 'y', long)]
-    pub yes: bool,
+    /// Only check for outdated dependencies.
+    #[arg(long, conflicts_with_all = ["vulns_only", "lint_only"])]
+    pub outdated_only: bool,
 
-    /// Never install missing checker tools; skip those ecosystems instead.
-    #[arg(long, conflicts_with = "yes")]
-    pub no_install: bool,
+    /// Only check for vulnerabilities.
+    #[arg(long, conflicts_with_all = ["outdated_only", "lint_only"])]
+    pub vulns_only: bool,
 
-    /// Also check transitive/indirect dependencies where supported.
+    /// Only run linters.
+    #[arg(long, conflicts_with_all = ["outdated_only", "vulns_only", "no_lint"])]
+    pub lint_only: bool,
+
+    /// Skip linters.
+    #[arg(long, conflicts_with = "lint_only")]
+    pub no_lint: bool,
+
+    /// Print a CycloneDX SBOM (JSON) to stdout instead of the audit report.
+    #[arg(
+        long,
+        conflicts_with_all = ["outdated_only", "vulns_only", "lint_only"]
+    )]
+    pub sbom: bool,
+
+    /// Also check transitive/indirect dependencies for outdatedness.
+    /// (Vulnerabilities always cover every known dependency.)
     #[arg(long)]
     pub deep: bool,
 
@@ -43,7 +59,28 @@ pub struct Args {
     #[arg(long)]
     pub fail_on_outdated: bool,
 
-    /// Print every external command before running it.
+    /// Exit with status 1 when any vulnerability is found.
+    #[arg(long)]
+    pub fail_on_vulns: bool,
+
+    /// Cap Android updates to releases needing at most this compileSdk.
+    /// Overrides depaudit.toml and auto-detection.
+    #[arg(long)]
+    pub max_compile_sdk: Option<u32>,
+
+    /// Bypass the disk cache (version lookups are cached 24h, vulns 6h).
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Clear the disk cache before auditing.
+    #[arg(long)]
+    pub clear_cache: bool,
+
+    /// Print extra progress information.
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Silence progress output (reports still print).
+    #[arg(short, long)]
+    pub quiet: bool,
 }

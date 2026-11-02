@@ -1,12 +1,12 @@
 [package]
-name = "freshdeps"
-version = "0.1.0"
+name = "depaudit"
+version = "0.0.1"
 edition = "2024"
-description = "Check whether a project's dependencies are the latest versions across Python, JavaScript, Rust, Go and Android projects"
+description = "Zero-dependency auditor for project dependencies: outdated and vulnerability checks across Python, JavaScript, Rust, Go and Android projects"
 license = "MIT"
 
 [[bin]]
-name = "freshdeps"
+name = "depaudit"
 path = "src/main.rs"
 
 [dependencies]
@@ -15,8 +15,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 regex = "1"
-toml = { version = "0.8", features = ["parse"] }
-ureq = { version = "3", features = ["rustls"] }
-
-[dev-dependencies]
+toml = { version = "1.1", features = ["parse"] }
+ureq = { version = "3", features = ["rustls", "json"] }
+semver = "1"
+rusqlite = { version = "0.41", features = ["bundled"] }
+node-semver = "2"
+pep440_rs = "0.7"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tempfile = "3"
