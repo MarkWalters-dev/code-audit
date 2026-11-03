@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
-# Build a versioned, checksummed release tarball for depaudit.
+# Build a Gentoo-ready vendored SOURCE tarball for depaudit.
 #
 # Usage:
 #   scripts/release.sh [--allow-dirty]
 #
-# Runs the full gate suite (fmt, clippy with warnings denied, tests),
-# builds with --locked --release, and writes
-#   dist/depaudit-<version>-<target>.tar.gz (+ .sha256)
-# The tarball is extracted to a temp dir and its binary smoke-tested
-# (`--version` must match Cargo.toml) before the script succeeds.
+# Runs the gates (fmt, clippy with warnings denied, tests), archives a
+# pristine HEAD tree, vendors every crates.io dependency into it, and
+# writes
+#   dist/depaudit-<version>.tar.gz (+ .sha256)
+# Upload the tarball to a GitHub release and point the ebuild's SRC_URI
+# at it. The tree builds fully offline (`cargo build --release
+# --frozen` with an empty CARGO_HOME) with no CRATES list needed in the
+# ebuild — the script proves it by doing exactly that from the
+# extracted tarball before succeeding.
 #
-# Set the version in Cargo.toml first. Tagging and pushing are left to
-# you; the script prints the exact commands at the end.
+# The release version is the Cargo.toml base version plus the commit
+# count as a build number (e.g. base 0.0.1 at 5 commits -> 0.0.1.5).
+# The build number lives only in the tarball name, the tag, and the
+# package manager: cargo files are never touched, so the binary
+# reports the base version. Tagging and pushing are left to you; the
+# script prints the exact commands at the end.
 set -euo pipefail
 
 ALLOW_DIRTY=0
@@ -21,52 +29,78 @@ fi
 
 cd "$(dirname "$0")/.."
 
-VERSION="$(awk '/^\[package\]/{p=1} p && /^version *= *"/{gsub(/"/, "", $3); print $3; exit}' Cargo.toml)"
-if [[ -z "$VERSION" ]]; then
+BASE_VERSION="$(awk '/^\[package\]/{p=1} p && /^version *= *"/{gsub(/"/, "", $3); print $3; exit}' Cargo.toml)"
+if [[ -z "$BASE_VERSION" ]]; then
     echo "release: cannot parse version from Cargo.toml" >&2
     exit 1
 fi
-TARGET="$(rustc -vV | awk '/^host:/{print $2}')"
-if [[ -z "$TARGET" ]]; then
-    echo "release: cannot determine target triple" >&2
-    exit 1
-fi
+BUILD="$(git rev-list --count HEAD)"
+VERSION="$BASE_VERSION.$BUILD"
 
 if [[ "$ALLOW_DIRTY" -eq 0 ]] && { ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; }; then
     echo "release: working tree is dirty; commit first or pass --allow-dirty" >&2
     exit 1
 fi
+if [[ "$ALLOW_DIRTY" -eq 1 ]]; then
+    echo "release: warning: archiving HEAD; uncommitted changes are excluded" >&2
+fi
 
-echo "release: depaudit $VERSION for $TARGET"
+echo "release: depaudit $VERSION source tarball (base $BASE_VERSION, build $BUILD)"
 echo "release: gates (fmt, clippy, tests)..."
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --quiet
 
-echo "release: building..."
-cargo build --locked --release --quiet
-
+echo "release: archiving HEAD..."
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/depaudit-$VERSION"
-cp target/release/depaudit LICENSE README.md "$STAGE/depaudit-$VERSION/"
+git archive HEAD | tar -x -C "$STAGE/depaudit-$VERSION"
 
+
+echo "release: vendoring dependencies..."
+mkdir -p "$STAGE/depaudit-$VERSION/.cargo"
+# Run from inside the staged tree with a relative vendor dir so the
+# recorded `directory = "vendor"` stays valid after unpacking anywhere.
+(
+    cd "$STAGE/depaudit-$VERSION"
+    cargo vendor vendor > .cargo/config.toml
+)
+if ! grep -q '^directory = "vendor"$' "$STAGE/depaudit-$VERSION/.cargo/config.toml"; then
+    echo "release: vendor config is not relocatable:" >&2
+    cat "$STAGE/depaudit-$VERSION/.cargo/config.toml" >&2
+    exit 1
+fi
+NCRATES="$(find "$STAGE/depaudit-$VERSION/vendor" -mindepth 1 -maxdepth 1 | wc -l)"
+echo "release: vendored $NCRATES crates"
+
+# Stable tarball: sorted entries, root ownership, HEAD commit mtime.
+EPOCH="$(git log -1 --format=%ct HEAD)"
 mkdir -p dist
-TARBALL="dist/depaudit-$VERSION-$TARGET.tar.gz"
-tar -czf "$TARBALL" -C "$STAGE" "depaudit-$VERSION"
+TARBALL="dist/depaudit-$VERSION.tar.gz"
+tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$EPOCH" \
+    -czf "$TARBALL" -C "$STAGE" "depaudit-$VERSION"
 sha256sum "$TARBALL" | awk '{print $1}' > "$TARBALL.sha256"
 
-echo "release: smoke-testing tarball..."
-SMOKE="$(mktemp -d)"
-trap 'rm -rf "$STAGE" "$SMOKE"' EXIT
-tar -xzf "$TARBALL" -C "$SMOKE"
-GOT="$("$SMOKE/depaudit-$VERSION/depaudit" --version)"
-if [[ "$GOT" != "depaudit $VERSION" ]]; then
-    echo "release: smoke test failed: got '$GOT', want 'depaudit $VERSION'" >&2
+echo "release: verifying offline build from tarball..."
+VERIFY="$(mktemp -d)"
+EMPTY_CARGO_HOME="$(mktemp -d)"
+trap 'rm -rf "$STAGE" "$VERIFY" "$EMPTY_CARGO_HOME"' EXIT
+tar -xzf "$TARBALL" -C "$VERIFY"
+# Drop the stage first: the verify build must prove the tarball is
+# self-contained, not accidentally reuse staged files.
+rm -rf "$STAGE"
+(
+    cd "$VERIFY/depaudit-$VERSION"
+    CARGO_HOME="$EMPTY_CARGO_HOME" CARGO_NET_OFFLINE=true cargo build --frozen --quiet
+)
+GOT="$("$VERIFY/depaudit-$VERSION/target/debug/depaudit" --version)"
+if [[ "$GOT" != "depaudit $BASE_VERSION" ]]; then
+    echo "release: verify failed: got '$GOT', want 'depaudit $BASE_VERSION'" >&2
     exit 1
 fi
 
-echo "release: ok: $TARBALL"
+echo "release: ok: $TARBALL ($(du -h "$TARBALL" | cut -f1))"
 echo "release: sha256: $(cat "$TARBALL.sha256")"
 if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
     echo "release: note: tag v$VERSION already exists; bump Cargo.toml for a new release" >&2

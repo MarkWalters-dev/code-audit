@@ -479,14 +479,29 @@ cargo fmt --check
 scripts/release.sh
 ```
 
-The script runs the gates above (clippy with warnings denied), builds
-with `--locked --release`, and writes a versioned tarball plus a
-sha256 file to `dist/` (e.g.
-`depaudit-0.1.0-x86_64-unknown-linux-gnu.tar.gz`), containing the
-binary, `LICENSE`, and `README.md`. It smoke-tests the tarball
-(`--version` must match `Cargo.toml`) and then prints the tag/push
-commands. Pass `--allow-dirty` for test builds from an uncommitted
-tree.
+The release version is the `Cargo.toml` base version plus the commit
+count as a build number (`0.0.1` at 5 commits → `0.0.1.5`). The build
+number lives only in the tarball name, the tag, and the package
+manager: cargo files are never touched, so the binary reports the
+base version.
+
+The script runs the gates above (clippy with warnings denied),
+archives a pristine `HEAD` tree, vendors every crates.io dependency
+into it (168 crates plus a relocatable `.cargo/config.toml`), and
+writes a versioned source tarball plus a sha256 file to `dist/` (e.g.
+`depaudit-0.0.1.5.tar.gz`). The tarball layout is the conventional
+`depaudit-<version>/` top dir with stable entry order, root ownership,
+and `HEAD` commit mtimes. Before succeeding, the script extracts the
+tarball and builds it fully offline (`cargo build --frozen` with an
+empty `CARGO_HOME` and no network), then checks `--version` — so
+whatever it produces is proven self-contained. It then prints the
+tag/push commands. Pass `--allow-dirty` for test builds from an
+uncommitted tree (the archive still reflects `HEAD`).
+
+Upload the tarball to a GitHub release and point the ebuild's `SRC_URI`
+at it. No `CRATES` list is needed: the build is a plain offline cargo
+invocation, e.g. `cargo build --release --frozen` followed by
+`dobin target/release/depaudit`.
 
 ## License
 
