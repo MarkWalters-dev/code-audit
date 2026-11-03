@@ -476,8 +476,13 @@ cargo fmt --check
 ```sh
 # 1. Set the version in Cargo.toml ([package] version).
 # 2. Commit everything; releases build from a clean tree.
-scripts/release.sh
+scripts/package.sh
 ```
+
+Plain `cargo build --release` and `cargo install` never invoke this
+script — it is only run explicitly (by you or by automation). A normal
+optimized build is just cargo; the script exists to produce the
+redistributable source tarball.
 
 The release version is the `Cargo.toml` base version plus the commit
 count as a build number (`0.0.1` at 5 commits → `0.0.1.5`). The build

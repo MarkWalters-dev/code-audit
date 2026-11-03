@@ -2,7 +2,7 @@
 # Build a Gentoo-ready vendored SOURCE tarball for depaudit.
 #
 # Usage:
-#   scripts/release.sh [--allow-dirty]
+#   scripts/package.sh [--allow-dirty]
 #
 # Runs the gates (fmt, clippy with warnings denied, tests), archives a
 # pristine HEAD tree, vendors every crates.io dependency into it, and
@@ -31,34 +31,34 @@ cd "$(dirname "$0")/.."
 
 BASE_VERSION="$(awk '/^\[package\]/{p=1} p && /^version *= *"/{gsub(/"/, "", $3); print $3; exit}' Cargo.toml)"
 if [[ -z "$BASE_VERSION" ]]; then
-    echo "release: cannot parse version from Cargo.toml" >&2
+    echo "package: cannot parse version from Cargo.toml" >&2
     exit 1
 fi
 BUILD="$(git rev-list --count HEAD)"
 VERSION="$BASE_VERSION.$BUILD"
 
 if [[ "$ALLOW_DIRTY" -eq 0 ]] && { ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; }; then
-    echo "release: working tree is dirty; commit first or pass --allow-dirty" >&2
+    echo "package: working tree is dirty; commit first or pass --allow-dirty" >&2
     exit 1
 fi
 if [[ "$ALLOW_DIRTY" -eq 1 ]]; then
-    echo "release: warning: archiving HEAD; uncommitted changes are excluded" >&2
+    echo "package: warning: archiving HEAD; uncommitted changes are excluded" >&2
 fi
 
-echo "release: depaudit $VERSION source tarball (base $BASE_VERSION, build $BUILD)"
-echo "release: gates (fmt, clippy, tests)..."
+echo "package: depaudit $VERSION source tarball (base $BASE_VERSION, build $BUILD)"
+echo "package: gates (fmt, clippy, tests)..."
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --quiet
 
-echo "release: archiving HEAD..."
+echo "package: archiving HEAD..."
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/depaudit-$VERSION"
 git archive HEAD | tar -x -C "$STAGE/depaudit-$VERSION"
 
 
-echo "release: vendoring dependencies..."
+echo "package: vendoring dependencies..."
 mkdir -p "$STAGE/depaudit-$VERSION/.cargo"
 # Run from inside the staged tree with a relative vendor dir so the
 # recorded `directory = "vendor"` stays valid after unpacking anywhere.
@@ -67,12 +67,12 @@ mkdir -p "$STAGE/depaudit-$VERSION/.cargo"
     cargo vendor vendor > .cargo/config.toml
 )
 if ! grep -q '^directory = "vendor"$' "$STAGE/depaudit-$VERSION/.cargo/config.toml"; then
-    echo "release: vendor config is not relocatable:" >&2
+    echo "package: vendor config is not relocatable:" >&2
     cat "$STAGE/depaudit-$VERSION/.cargo/config.toml" >&2
     exit 1
 fi
 NCRATES="$(find "$STAGE/depaudit-$VERSION/vendor" -mindepth 1 -maxdepth 1 | wc -l)"
-echo "release: vendored $NCRATES crates"
+echo "package: vendored $NCRATES crates"
 
 # Stable tarball: sorted entries, root ownership, HEAD commit mtime.
 EPOCH="$(git log -1 --format=%ct HEAD)"
@@ -82,7 +82,7 @@ tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$EPOCH" \
     -czf "$TARBALL" -C "$STAGE" "depaudit-$VERSION"
 sha256sum "$TARBALL" | awk '{print $1}' > "$TARBALL.sha256"
 
-echo "release: verifying offline build from tarball..."
+echo "package: verifying offline build from tarball..."
 VERIFY="$(mktemp -d)"
 EMPTY_CARGO_HOME="$(mktemp -d)"
 trap 'rm -rf "$STAGE" "$VERIFY" "$EMPTY_CARGO_HOME"' EXIT
@@ -96,16 +96,16 @@ rm -rf "$STAGE"
 )
 GOT="$("$VERIFY/depaudit-$VERSION/target/debug/depaudit" --version)"
 if [[ "$GOT" != "depaudit $BASE_VERSION" ]]; then
-    echo "release: verify failed: got '$GOT', want 'depaudit $BASE_VERSION'" >&2
+    echo "package: verify failed: got '$GOT', want 'depaudit $BASE_VERSION'" >&2
     exit 1
 fi
 
-echo "release: ok: $TARBALL ($(du -h "$TARBALL" | cut -f1))"
-echo "release: sha256: $(cat "$TARBALL.sha256")"
+echo "package: ok: $TARBALL ($(du -h "$TARBALL" | cut -f1))"
+echo "package: sha256: $(cat "$TARBALL.sha256")"
 if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
-    echo "release: note: tag v$VERSION already exists; bump Cargo.toml for a new release" >&2
+    echo "package: note: tag v$VERSION already exists; bump Cargo.toml for a new release" >&2
 else
-    echo "release: next:"
+    echo "package: next:"
     echo "  git tag v$VERSION"
     echo "  git push github v$VERSION   # and/or: git push origin v$VERSION"
 fi
