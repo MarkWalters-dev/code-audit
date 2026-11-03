@@ -471,6 +471,23 @@ cargo clippy --all-targets
 cargo fmt --check
 ```
 
+## Release
+
+```sh
+# 1. Set the version in Cargo.toml ([package] version).
+# 2. Commit everything; releases build from a clean tree.
+scripts/release.sh
+```
+
+The script runs the gates above (clippy with warnings denied), builds
+with `--locked --release`, and writes a versioned tarball plus a
+sha256 file to `dist/` (e.g.
+`depaudit-0.1.0-x86_64-unknown-linux-gnu.tar.gz`), containing the
+binary, `LICENSE`, and `README.md`. It smoke-tests the tarball
+(`--version` must match `Cargo.toml`) and then prints the tag/push
+commands. Pass `--allow-dirty` for test builds from an uncommitted
+tree.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
