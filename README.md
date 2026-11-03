@@ -484,6 +484,15 @@ script — it is only run explicitly (by you or by automation). A normal
 optimized build is just cargo; the script exists to produce the
 redistributable source tarball.
 
+With `--binary` it also builds an optimized release binary from that
+same staged tree and writes a second asset,
+`depaudit-<version>-<platform>.tar.gz` (e.g.
+`depaudit-0.0.1.6-linux-x86_64.tar.gz`, binary + README + LICENSE),
+for the same GitHub release. The platform is a shortened triple
+(`linux-x86_64` rather than `x86_64-unknown-linux-gnu` — `unknown` is
+just the conventional vendor slot); unmapped triples pass through
+unchanged.
+
 The release version is the `Cargo.toml` base version plus the commit
 count as a build number (`0.0.1` at 5 commits → `0.0.1.5`). The build
 number lives only in the tarball name, the tag, and the package
